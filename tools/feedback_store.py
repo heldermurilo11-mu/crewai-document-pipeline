@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import Dict, Any, Optional, List
 from datetime import datetime
 
+from runtime.files import atomic_json
+
 logger = logging.getLogger(__name__)
 
 # Diretório para persistência de feedback
@@ -42,9 +44,8 @@ class FeedbackStore:
             return {"entries": [], "stats": {}}
 
     def _save_data(self, data: Dict[str, Any]) -> None:
-        """Salva o arquivo de feedback."""
-        with open(self.feedback_file, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        """Salva o arquivo de feedback atomicamente."""
+        atomic_json(self.feedback_file, data)
 
     def _file_hash(self, file_path: str) -> str:
         """Gera hash SHA-256 do arquivo para identificação única."""
