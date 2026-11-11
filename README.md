@@ -1,8 +1,22 @@
-# 🤖 CrewAI Document Pipeline (PROTOCREW)
+# 🤖 CrewAI Document Pipeline
 
-Pipeline **100% autônomo** de leitura de **Cadeias de Custódia (COC)** laboratoriais, construído com [CrewAI](https://docs.crewai.com/) + [Google Gemini](https://ai.google.dev/).
+Pipeline **autônomo e resiliente** de leitura de **Cadeias de Custódia (COC)** e formulários tabulares, construído sobre [CrewAI](https://docs.crewai.com/) + [Google Gemini Vision](https://ai.google.dev/) com engenharia de confiabilidade de nível de produção.
 
-O robô baixa PDFs do Google Drive, identifica o template do laboratório, extrai dados via OCR com IA (código da amostra, identificação, data, hora), valida os resultados e exporta tudo em CSV — sem intervenção humana.
+O fluxo adquire documentos via Google Drive (ou diretório local `--local-dir`), rasteriza páginas PDF a **300 DPI** em memória sem modificar os originais, corrige a orientação por página via Visão Computacional, extrai dados sob **JSON Schema estrito** com comprovação de cobertura de páginas (`covered_pages` / `source_pages`), persiste estado em **SQLite WAL** recuperável de falhas e exporta o resultado consolidado em CSV atômico.
+
+---
+
+## 🏗️ Arquitetura de Confiabilidade
+
+Este repositório evoluiu de uma orquestração CrewAI sequencial simples para incorporar mecanismos completos de resiliência operacional:
+
+1. **Journal Transacional SQLite WAL (`runtime/checkpoint.py`)**: Registro durável com `PRAGMA synchronous=FULL`, identidade determinística por `(source_id, revision)`, detecção de conflitos e recuperação automática de estados em trânsito (`SENDING -> UNCERTAIN`, `EXTRACTING -> DEFERRED`).
+2. **Rasterização 300 DPI + Orientação por Página (`runtime/extraction.py`, `tools/orientation_tool.py`, `tools/pdf_processor.py`)**: Conversão lossless via PyMuPDF em diretório temporário/isolado preservando o PDF original intacto, detecção visual em lote `[0, 90, 180, 270]`, cache SHA-256 com TTL de 47h na Files API (`uploads.json`) e validação obrigatória de `finish_reason == "STOP"`, streaming limitado e cobertura completa `1..N`.
+3. **Orçamento Monotônico de Tempo (`runtime/deadline.py`, `runtime/config.py`)**: Propagação de `Deadline` baseada em `time.monotonic()`, clamping explícito de timeouts HTTP em milissegundos (`HttpOptions` com `attempts=1`) e validação estrita de invariantes de configuração.
+4. **Contenção de Subprocessos por SO (`runtime/supervisor.py`, `runtime/ocr_worker.py`)**: Execução isolada de cada documento em subprocesso `spawn`, associado a **Windows Job Objects** (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) ou sessões POSIX com guarda contra reuso de PID, além de bounded logging (2 MB) e modo watchdog `--mode supervise`.
+5. **I/O Atômico e Bloqueio de Concorrência (`runtime/files.py`)**: Escrita atômica (`mkstemp` + `fsync` + `os.replace`) para JSON/CSV (`output/resultado_crew.csv`) e lock exclusivo `InstanceLock` (`msvcrt`/`fcntl`) para evitar execuções simultâneas.
+6. **Camada CrewAI Integrada (`crew.py`, `tools/crew_wrappers.py`, `tools/_crew_compat.py`)**: Decorators `@CrewBase` / `@tool` com adaptadores compatíveis para execução tanto via CrewAI quanto no modo pipeline resiliente e suíte de testes offline.
+7. **Testes Determinísticos Offline (`tests/`)**: Suíte automatizada com clientes simulados (`FakeClient`, `FakeDrive`), PDFs sintéticos PyMuPDF e validação em CI (`.github/workflows/ci.yml`).
 
 ---
 
@@ -10,154 +24,115 @@ O robô baixa PDFs do Google Drive, identifica o template do laboratório, extra
 
 ```text
 crewai-document-pipeline/
-├── main.py                      # Ponto de entrada do programa
-├── crew.py                      # Orquestrador CrewAI (agentes + tarefas)
+├── main.py                      # CLI unificada (--mode crew | pipeline | supervise)
+├── crew.py                      # Orquestrador CrewAI sequencial (ProtocrewCrew)
 ├── requirements.txt             # Dependências Python
-├── .env.example                 # Modelo de variáveis de ambiente
-├── credentials.example.json     # Modelo de credenciais OAuth2 do Google Drive
+├── .env.example                 # Modelo completo de variáveis de ambiente
+├── credentials.example.json     # Modelo OAuth2 Desktop do Google Drive
+├── .github/workflows/ci.yml     # CI automatizado com pytest
 │
-├── config/                      # Configuração dos agentes, tarefas e templates
-│   ├── agents.yaml              # Definição dos agentes CrewAI
-│   ├── tasks.yaml               # Definição das tarefas CrewAI
-│   └── template_registry.json   # Registro de templates de COC
+├── config/
+│   ├── agents.yaml              # Definição dos 3 agentes CrewAI
+│   ├── tasks.yaml               # Definição das 3 tarefas sequenciais
+│   └── template_registry.json   # Registry de layouts (LAB_ALPHA, LAB_BETA, rascunhos)
 │
-└── tools/                       # Ferramentas usadas pelos agentes
-    ├── __init__.py
-    ├── crew_wrappers.py         # Wrappers @tool para integração com o CrewAI
-    ├── drive_tools.py           # Download/listagem/movimentação no Google Drive
-    ├── pattern_identifier.py    # Identificação automática de template
-    ├── filler_agent.py          # Extração de dados parametrizada
-    ├── reviewer.py              # Validação automática dos dados
-    ├── feedback_store.py        # Persistência de feedback para evolução
-    └── utils.py                 # Funções utilitárias (normalização)
+├── runtime/
+│   ├── config.py                # RuntimeConfig congelado e validado via ambiente
+│   ├── deadline.py              # Deadline monotônico e clamping de timeout HTTP
+│   ├── files.py                 # atomic_write_text, atomic_json e InstanceLock
+│   ├── checkpoint.py            # Journal SQLite WAL (Checkpoint, PublicationConflict)
+│   ├── supervisor.py            # WindowsJob / killpg, LimitedLog, run_worker, watchdog
+│   ├── extraction.py            # Rasterização 300 DPI, upload cache, schema e stream guard
+│   ├── ocr_worker.py            # Worker isolado com verificação MD5 e progress markers
+│   └── pipeline.py              # DocumentPipeline com circuit breaker e exportação CSV atômica
+│
+├── tools/
+│   ├── _crew_compat.py          # Compatibilidade opcional com crewai para modo standalone/CI
+│   ├── crew_wrappers.py         # Wrappers @tool (Download, Extração 300 DPI, Validação/Export)
+│   ├── drive_tools.py           # GoogleDriveDownloadTool com download .partial + move idempotente
+│   ├── pattern_identifier.py    # Match por âncoras via PyMuPDF + fallback Gemini
+│   ├── filler_agent.py          # Construção de prompt parametrizado + pipeline 300 DPI
+│   ├── orientation_tool.py      # Detecção visual de rotação [0, 90, 180, 270]
+│   ├── pdf_processor.py         # Rotação em memória via pypdf
+│   ├── reviewer.py              # Validação estrutural automática das amostras
+│   ├── feedback_store.py        # Persistência atômica de métricas por template
+│   └── utils.py                 # Normalização de código, hora e prefixos configuráveis
+│
+└── tests/
+    ├── test_extraction.py
+    ├── test_checkpoint_pipeline.py
+    ├── test_supervisor.py
+    ├── test_tools_and_utils.py
+    └── workers.py
 ```
 
 ---
 
-## 📄 Descrição dos Arquivos
-
-### Raiz
-
-| Arquivo | Descrição | Obrigatório? |
-|---|---|---|
-| `main.py` | Ponto de entrada. Carrega `.env`, valida `DRIVE_FOLDER_ID`, configura o modelo Gemini e dispara a `crew`. | ✅ Sim |
-| `crew.py` | Define a `ProtocrewCrew` usando decorators do CrewAI. Conecta agentes a tarefas em fluxo sequencial. | ✅ Sim |
-| `requirements.txt` | Lista de dependências (`crewai`, `google-genai`, `google-api-python-client`, etc.). | ✅ Sim |
-| `.env.example` | Modelo de variáveis de ambiente (`GEMINI_API_KEY`, `DRIVE_FOLDER_ID`). Copiar para `.env`. | ✅ Sim |
-| `credentials.example.json` | Modelo de credenciais OAuth2 Desktop do Google Drive. Copiar/substituir por `credentials.json`. | ✅ Sim, para acesso ao Drive |
-
-### `config/`
-
-| Arquivo | Descrição | Obrigatório? |
-|---|---|---|
-| `agents.yaml` | Define os 3 agentes (`drive_manager`, `ocr_specialist`, `data_analyst`) com role, goal e backstory. | ✅ Sim |
-| `tasks.yaml` | Define as 3 tarefas sequenciais: `download_files`, `extract_data`, `validate_and_export`. | ✅ Sim |
-| `template_registry.json` | Registro de templates de COC (ex.: `LAB_ALPHA`, `LAB_BETA`). Contém âncoras de detecção, mapeamento de campos e regras especiais por template. | ✅ Sim |
-
-### `tools/`
-
-| Arquivo | Descrição | Obrigatório? | Uso em outros projetos |
-|---|---|---|---|
-| `crew_wrappers.py` | Adapta as ferramentas para o formato `@tool` do CrewAI (`Baixar_Arquivos_Drive`, `Extrair_Dados_Cadeia_Custodia`, `Validar_e_Exportar_Dados`). | ✅ Sim | 🔒 Específico deste projeto |
-| `drive_tools.py` | Classe `GoogleDriveDownloadTool`: autenticação OAuth2, listagem, download e movimentação de arquivos no Google Drive. | ✅ Sim | ♻️ **Reutilizável** em qualquer projeto que precise acessar Google Drive |
-| `pattern_identifier.py` | Classe `PatternIdentifierTool`: identificação do template de uma COC em **2 camadas** — (1) match rápido por âncoras textuais via regex e (2) fallback por inferência via Gemini. Templates novos são salvos como rascunho no registry. | ✅ Sim | ♻️ Parcialmente reutilizável (lógica de match por âncoras) |
-| `filler_agent.py` | Classe `FillerAgentTool`: extração parametrizada de dados. Recebe o `field_map` do `PatternIdentifierTool` e monta um prompt Gemini dinâmico para extrair código, identificação, data e hora. | ✅ Sim | 🔒 Específico (depende do `field_map`) |
-| `reviewer.py` | Classe `Reviewer`: validação automática dos dados extraídos. Verifica formato do código (7 dígitos), data válida (`DD/MM/AAAA`), hora (`HH:MM`) e identificação. Classifica amostras como `APROVADO` ou `REJEITADO`. | ✅ Sim | ♻️ **Reutilizável** em projetos de validação de dados laboratoriais |
-| `feedback_store.py` | Classe `FeedbackStore`: registra sucesso/falha das extrações por template em `output/feedback/`. Mantém estatísticas para promoção automática de templates (rascunho → validado) e detecção de degradação. | ⚠️ Opcional | ♻️ **Reutilizável** como sistema genérico de feedback e evolução |
-| `utils.py` | Funções auxiliares `normalize_time()`, `normalize_code()` e `get_configured_prefixes()`. Corrige formatos comuns de OCR (ex.: `10h35` → `10:35`) com prefixos opcionais configuráveis. | ✅ Sim | ♻️ **Reutilizável** |
-
----
-
-## ⚙️ Como Funciona (Pipeline)
-
-O pipeline é **sequencial** e opera em 3 etapas:
-
-```text
-1. DOWNLOAD          2. EXTRAÇÃO (OCR)         3. VALIDAÇÃO + EXPORT
-┌──────────────┐    ┌──────────────────────┐   ┌────────────────────┐
-│ drive_manager│───>│  ocr_specialist      │──>│  data_analyst      │
-│              │    │                      │   │                    │
-│ Baixa PDFs   │    │ 1. Identifica layout │   │ Revisa cada amostra│
-│ do Drive     │    │ 2. Extrai dados      │   │ Exporta para CSV   │
-│ → input_files│    │    com Gemini OCR    │   │ Remove PDFs locais │
-└──────────────┘    └──────────────────────┘   └────────────────────┘
-```
-
-### Detalhamento
-
-1. **Download** (`drive_manager`): Conecta ao Google Drive via OAuth2, lista e baixa todos os PDFs da pasta configurada em `DRIVE_FOLDER_ID` para `input_files/`.
-2. **Extração** (`ocr_specialist`): Para cada PDF:
-   - O `PatternIdentifierTool` identifica o template (`LAB_ALPHA`, `LAB_BETA`, etc.) usando âncoras textuais ou inferência via Gemini.
-   - O `FillerAgentTool` monta um prompt parametrizado pelo `field_map` do template e envia ao Gemini para extração dos campos.
-3. **Validação e Exportação** (`data_analyst`): O `Reviewer` valida cada amostra (formato do código, data, hora) e o resultado é exportado para `output/resultado_crew.csv`.
-
----
-
-## 🧩 Templates de Exemplo (`template_registry.json`)
-
-| Template | Status | Descrição |
-|---|---|---|
-| `LAB_ALPHA` | ✅ Validado | Layout tabular padrão com campos impressos e código manuscrito |
-| `LAB_BETA` | ✅ Validado | Layout com identificação composta (`{protocolo} - {ponto_coleta}`) e coleta em célula combinada |
-
-> Templates novos são detectados automaticamente via Gemini e salvos como rascunho no `template_registry.json`. Após 10+ extrações com 90%+ de aprovação, podem ser promovidos para "validado".
-
----
-
-## 🚀 Instalação e Execução
-
-### Pré-requisitos
-- Python 3.10+
-- Projeto no Google Cloud Console com a API Google Drive habilitada
-- Chave de API do Google Gemini
-
-### Setup
+## ⚙️ Modos de Execução (`main.py`)
 
 ```bash
-# 1. Criar e ativar ambiente virtual
+# 1. Modo CrewAI (padrão): executa os 3 agentes sequenciais com ferramentas hardened
+python main.py --mode crew
+
+# 2. Modo Pipeline Resiliente: SQLite WAL + Workers isolados + CSV atômico
+python main.py --mode pipeline --dry-run
+
+# 3. Processamento local sem Google Drive (pasta com PDFs/imagens)
+python main.py --mode pipeline --local-dir ./input_files --dry-run
+
+# 4. Modo Watchdog Supervisor: encapsula o lote inteiro com hard-kill por orçamento
+python main.py --mode supervise
+```
+
+---
+
+## 🧪 Setup e Testes Offline
+
+```bash
+# 1. Criar ambiente virtual e instalar dependências
 python -m venv venv
 venv\Scripts\activate        # Windows
 # source venv/bin/activate   # Linux/Mac
-
-# 2. Instalar dependências
 pip install -r requirements.txt
 
-# 3. Configurar variáveis de ambiente a partir do modelo
+# 2. Configurar variáveis de ambiente
 cp .env.example .env
-# Edite o .env preenchendo GEMINI_API_KEY e DRIVE_FOLDER_ID
-
-# 4. Configurar credenciais OAuth2 do Google Drive
-# Baixe suas credenciais OAuth2 Desktop no Google Cloud Console e salve como credentials.json
-# (use credentials.example.json como referência de estrutura)
 cp credentials.example.json credentials.json
 
-# 5. Executar
-python main.py
+# 3. Executar suíte de testes unitários (100% offline, sem APIs externas)
+python -m pytest -v
 ```
-
-Na primeira execução, o fluxo OAuth abrirá o navegador para autorizar o acesso ao Google Drive. O `token.json` será gerado automaticamente (e permanece ignorado pelo `.gitignore`).
 
 ---
 
-## 📊 Saída
+## 🔑 Variáveis de Ambiente Principais
 
-O resultado é exportado em `output/resultado_crew.csv` com a estrutura:
+| Variável | Padrão | Descrição |
+|---|---|---|
+| `GEMINI_API_KEY` | — | Chave da API Google Gemini |
+| `DRIVE_FOLDER_ID` | — | ID da pasta de entrada no Google Drive |
+| `SAMPLE_CODE_PREFIXES` | `""` | Prefixos opcionais separados por vírgula para normalização |
+| `GEMINI_MODEL_PRO` | `gemini-2.5-pro` | Modelo principal de extração |
+| `GEMINI_MODEL_FAST` | `gemini-2.5-flash` | Modelo rápido para orientação e inferência |
+| `PIPELINE_MODE` | `crew` | Modo padrão (`crew`, `pipeline` ou `supervise`) |
+| `PIPELINE_STATE_DIR` | `state` | Diretório do SQLite WAL (`journal.sqlite3`), locks e logs de workers |
+| `PIPELINE_OUTPUT_CSV` | `output/resultado_crew.csv` | Caminho de exportação consolidada atômica |
+| `BATCH_BUDGET_SECONDS` | `1500` | Orçamento total de tempo do lote |
+| `FILE_BUDGET_SECONDS` | `600` | Orçamento máximo por documento |
+| `ORIENTATION_ENABLED` | `true` | Ativa detecção automática de páginas rotacionadas |
+| `STREAMING_ENABLED` | `true` | Ativa streaming com verificação obrigatória de `STOP` |
+| `DRY_RUN` | `false` | Executa análise/CSV sem mover arquivos no Drive |
+| `MOVE_DRIVE_FILES` | `true` | Move arquivos no Drive para `processados`/`rejeitados` |
+
+---
+
+## 📊 Saída Consolidada (`output/resultado_crew.csv`)
 
 ```csv
 Arquivo;Codigo;Identificacao;DataHora;Template;Status;Motivo
 doc1.pdf;0001234;2026/001 - Ponto Norte;10/02/2026 09:45;LAB_ALPHA;APROVADO;
 doc2.pdf;12345;PONTO-B2;15/03/2026 14:30;LAB_BETA;REJEITADO;Código '12345' não tem 7 dígitos numéricos
 ```
-
----
-
-## 🔑 Variáveis de Ambiente
-
-| Variável | Obrigatória? | Descrição |
-|---|---|---|
-| `GEMINI_API_KEY` | ✅ Sim | Chave da API do Google Gemini para OCR e inferência de layout |
-| `DRIVE_FOLDER_ID` | ✅ Sim | ID da pasta do Google Drive contendo os PDFs de entrada |
-| `SAMPLE_CODE_PREFIXES` | ❌ Opcional | Lista separada por vírgulas de prefixos esperados para normalização de códigos de amostra |
 
 ---
 

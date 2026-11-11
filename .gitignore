@@ -5,8 +5,14 @@
 credentials.json
 token.json
 
-# Logs
+# Logs & State
 *.log
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+state/
+work/
+downloads/
 
 # Runtime & Data
 output/
@@ -14,9 +20,11 @@ input_files/
 
 # Python
 venv/
+.venv/
 __pycache__/
 *.py[cod]
 *$py.class
+.pytest_cache/
 
 # IDE
 .vscode/

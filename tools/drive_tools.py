@@ -1,212 +1,249 @@
+"""Hardened Google Drive tool with OAuth2/SA auth, clamped deadlines, and atomic downloads."""
+
+from dataclasses import dataclass, field
+import json
+import logging
 import os
-import io
-from typing import List, Set, Optional, Dict, Any, TYPE_CHECKING
-from crewai.tools import BaseTool
+from pathlib import Path
+from typing import Any, Optional
+
+import google.auth
 from google.auth.transport.requests import Request
+from google.oauth2 import service_account
 from google.oauth2.credentials import Credentials
+from google_auth_httplib2 import AuthorizedHttp
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
-import logging
+import httplib2
+
+from runtime.deadline import Deadline
 
 logger = logging.getLogger(__name__)
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BASE_DIR = Path(__file__).resolve().parent.parent
+SCOPES = ["https://www.googleapis.com/auth/drive"]
 
-class GoogleDriveDownloadTool(BaseTool):
+
+def _query_literal(value: str) -> str:
+    """Escape backslashes and single quotes for Google Drive search queries."""
+    return str(value).replace("\\", "\\\\").replace("'", "\\'")
+
+
+@dataclass
+class GoogleDriveDownloadTool:
+    """Lists, downloads atomically, and idempotently moves PDF/image documents in Google Drive."""
+
     name: str = "Google Drive Downloader"
     description: str = (
-        "Conecta ao Google Drive, lista arquivos de uma pasta específica "
-        "e baixa eles para processamento local."
+        "Lista e baixa PDFs ou imagens do Google Drive com transporte com timeout, "
+        "download atômico e movimentação idempotente de pastas."
     )
-    
     credentials_dict: Optional[dict] = None
     token_dict: Optional[dict] = None
+    deadline: Optional[Deadline] = None
+    request_timeout: float = 120.0
+    _service: Any = field(default=None, init=False, repr=False)
+    _credentials: Any = field(default=None, init=False, repr=False)
+
+    def _timeout(self) -> float:
+        if self.deadline is not None:
+            return self.deadline.timeout(self.request_timeout)
+        return self.request_timeout
 
     def _get_service(self):
-        """Gerencia a autenticação OAuth2 do Google."""
-        SCOPES = ['https://www.googleapis.com/auth/drive']
+        if self._service is not None:
+            self._service._http.http.timeout = self._timeout()
+            return self._service
+
+        scopes = list(SCOPES)
         creds = None
-        
-        # 1. Tenta carregar do Token injetado (Vault)
-        if self.token_dict:
-            try:
-                creds = Credentials.from_authorized_user_info(self.token_dict, SCOPES)
-                logger.info("🔑 Usando Token do Vault.")
-            except Exception as e:
-                logger.warning(f"⚠️ Falha ao carregar Token do Vault: {e}")
+        token_info = self.token_dict
+        token_path = BASE_DIR / "token.json"
+        creds_path = BASE_DIR / "credentials.json"
 
-        # 2. Se não conseguiu, tenta do arquivo token.json local
-        token_path = os.path.join(BASE_DIR, 'token.json')
-        if not creds and os.path.exists(token_path):
-            try:
-                creds = Credentials.from_authorized_user_file(token_path, SCOPES)
-                logger.info("🔑 Usando token.json local.")
-            except Exception as e:
-                logger.warning(f"⚠️ Falha ao carregar token.json local: {e}")
-            
-        # 3. Validação e Refresh
+        if not token_info and token_path.is_file():
+            token_info = json.loads(token_path.read_text(encoding="utf-8"))
+
+        if token_info:
+            granted = token_info.get("scopes") or token_info.get("scope")
+            if isinstance(granted, str):
+                granted = granted.split()
+            if granted:
+                matched = [s for s in scopes if s in granted]
+                if not matched:
+                    raise RuntimeError("OAuth token grants none of the required Google Drive scopes")
+                scopes = matched
+            creds = Credentials.from_authorized_user_info(token_info, scopes)
+
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(
+                lambda *args, **kwargs: Request()(*args, **{**kwargs, "timeout": self._timeout()})
+            )
+
         if not creds or not creds.valid:
-            if creds and creds.expired and creds.refresh_token:
-                try:
-                    creds.refresh(Request())
-                    logger.info("🔄 Token atualizado via Refresh Token.")
-                except Exception as e:
-                    logger.error(f"❌ Falha no refresh do token: {e}")
-                    creds = None
+            client_cfg = self.credentials_dict
+            if not client_cfg and creds_path.is_file():
+                client_cfg = json.loads(creds_path.read_text(encoding="utf-8"))
 
-            # 4. Se ainda não tem creds válidas, tenta iniciar fluxo de auth
-            if not creds:
-                credentials_path = os.path.join(BASE_DIR, 'credentials.json')
-                if self.credentials_dict:
-                    logger.info("🔐 Iniciando fluxo de auth com Credentials do Vault.")
-                    flow = InstalledAppFlow.from_client_config(
-                        self.credentials_dict, SCOPES)
-                elif os.path.exists(credentials_path):
-                    logger.info("🔐 Iniciando fluxo de auth com credentials.json local.")
-                    flow = InstalledAppFlow.from_client_secrets_file(
-                        credentials_path, SCOPES)
+            if client_cfg:
+                if client_cfg.get("type") == "service_account":
+                    creds = service_account.Credentials.from_service_account_info(
+                        client_cfg, scopes=scopes
+                    )
+                elif os.getenv("ALLOW_INTERACTIVE_AUTH", "true").lower() == "true":
+                    flow = InstalledAppFlow.from_client_config(client_cfg, scopes)
+                    creds = flow.run_local_server(port=0, timeout_seconds=int(self._timeout()))
+                    token_path.write_text(creds.to_json(), encoding="utf-8")
                 else:
-                    raise FileNotFoundError("Nenhuma credencial encontrada (Vault ou Local)!")
-                
-                # Este passo exige interação humana (browser)
-                creds = flow.run_local_server(port=0)
-            
-            # Salva o novo token localmente para facilitar dev futuro (opcional)
-            with open(os.path.join(BASE_DIR, 'token.json'), 'w') as token:
-                token.write(creds.to_json())
+                    raise RuntimeError("Interactive OAuth is disabled for unattended pipeline runs")
+            else:
+                creds, _ = google.auth.default(scopes=scopes)
 
-        return build('drive', 'v3', credentials=creds)
+        self._credentials = creds
+        transport = AuthorizedHttp(
+            creds,
+            http=httplib2.Http(timeout=self._timeout()),
+            max_refresh_attempts=1,
+        )
+        self._service = build(
+            "drive",
+            "v3",
+            http=transport,
+            cache_discovery=False,
+            static_discovery=True,
+        )
+        return self._service
 
-    def list_files(self, folder_id: str) -> List[Dict[str, str]]:
-        """Lista todos os arquivos de uma pasta com suporte a paginação.
-
-        Args:
-            folder_id: ID da pasta no Google Drive.
-
-        Returns:
-            Lista de dicionários contendo {'id': ..., 'name': ...}.
-        """
+    def _execute(self, request):
         service = self._get_service()
-        all_items = []
-        next_page_token = None
-        query = f"'{folder_id}' in parents and trashed = false and mimeType != 'application/vnd.google-apps.folder'"
+        service._http.http.timeout = self._timeout()
+        return request.execute(num_retries=0)
 
+    def list_files(self, folder_id: str, limit: Optional[int] = None) -> list[dict]:
+        """List PDFs and scanned images in *folder_id* with checksum/revision metadata."""
+        service = self._get_service()
+        safe_folder = _query_literal(folder_id)
+        query = (
+            f"'{safe_folder}' in parents and trashed = false "
+            "and (mimeType = 'application/pdf' or mimeType contains 'image/')"
+        )
+        items: list[dict] = []
+        page_token: Optional[str] = None
         while True:
-            results = service.files().list(
-                q=query,
-                fields="nextPageToken, files(id, name)",
-                pageToken=next_page_token
-            ).execute()
-
-            items = results.get('files', [])
-            all_items.extend(items)
-
-            next_page_token = results.get('nextPageToken')
-            if not next_page_token:
+            result = self._execute(
+                service.files().list(
+                    q=query,
+                    pageSize=100,
+                    pageToken=page_token,
+                    orderBy="createdTime",
+                    fields="nextPageToken,files(id,name,md5Checksum,modifiedTime,createdTime,size,mimeType)",
+                )
+            )
+            items.extend(result.get("files", []))
+            if limit is not None and len(items) >= limit:
+                items = items[:limit]
+                break
+            page_token = result.get("nextPageToken")
+            if not page_token:
                 break
 
-        # Limpa nomes (strip)
-        for item in all_items:
-            item['name'] = item['name'].strip()
+        for item in items:
+            item["name"] = str(item.get("name", "")).strip()
+        return items
 
-        return all_items
-
-    def download_file(self, file_id: str, file_name: str) -> Optional[str]:
-        """Baixa um único arquivo do Google Drive por ID.
-
-        Args:
-            file_id: ID do arquivo no Drive.
-            file_name: Nome que o arquivo terá localmente.
-
-        Returns:
-            Caminho absoluto do arquivo baixado ou None se falhar.
-        """
-        service = self._get_service()
-        local_folder = os.path.join(BASE_DIR, "input_files")
-        os.makedirs(local_folder, exist_ok=True)
-        file_path = os.path.join(local_folder, file_name)
-
-        try:
-            logger.info(f"📥 Baixando arquivo: {file_name}...")
-            request = service.files().get_media(fileId=file_id)
-            fh = io.FileIO(file_path, 'wb')
-            downloader = MediaIoBaseDownload(fh, request)
-            done = False
-            while done is False:
-                status, done = downloader.next_chunk()
-            
-            logger.info(f"✅ Download concluído: {file_name}")
-            return file_path
-        except Exception as e:
-            logger.error(f"❌ Erro ao baixar {file_name}: {e}")
-            return None
-
-    def get_or_create_subfolder(self, parent_folder_id: str, subfolder_name: str) -> str:
-        """Busca uma subpasta pelo nome dentro de uma pasta pai. Cria se não existir.
-
-        Args:
-            parent_folder_id: ID da pasta pai no Drive.
-            subfolder_name: Nome da subpasta.
-
-        Returns:
-            ID da subpasta encontrada ou criada.
-        """
+    def find_file_by_name(self, folder_id: str, file_name: str) -> Optional[dict]:
         service = self._get_service()
         query = (
-            f"'{parent_folder_id}' in parents and "
-            f"name = '{subfolder_name}' and "
-            f"mimeType = 'application/vnd.google-apps.folder' and "
-            f"trashed = false"
+            f"'{_query_literal(folder_id)}' in parents "
+            f"and name = '{_query_literal(file_name)}' and trashed = false"
         )
-        results = service.files().list(q=query, fields="files(id)").execute()
-        folders = results.get('files', [])
+        result = self._execute(service.files().list(q=query, fields="files(id,name,md5Checksum,modifiedTime)"))
+        return next(iter(result.get("files", [])), None)
 
-        if folders:
-            logger.info(f"📁 Subpasta '{subfolder_name}' encontrada.")
-            return folders[0]['id']
+    def download_file(
+        self,
+        file_id: str,
+        file_name: str,
+        destination: Optional[str | Path] = None,
+    ) -> Optional[str]:
+        """Atomically stream *file_id* into `.partial`, fsync, and os.replace."""
+        service = self._get_service()
+        target = (
+            Path(destination).resolve()
+            if destination is not None
+            else (BASE_DIR / "input_files" / Path(file_name).name).resolve()
+        )
+        target.parent.mkdir(parents=True, exist_ok=True)
+        partial = target.with_suffix(target.suffix + ".partial")
+        try:
+            with partial.open("wb") as stream:
+                downloader = MediaIoBaseDownload(
+                    stream,
+                    service.files().get_media(fileId=file_id),
+                    chunksize=4 * 1024 * 1024,
+                )
+                done = False
+                while not done:
+                    if self.deadline is not None:
+                        self.deadline.check("download chunk")
+                    service._http.http.timeout = self._timeout()
+                    _, done = downloader.next_chunk(num_retries=0)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(partial, target)
+            return str(target)
+        except Exception as exc:
+            logger.error("Erro no download atômico do arquivo %s (%s): %s", file_name, file_id, exc)
+            raise
+        finally:
+            if partial.exists():
+                partial.unlink(missing_ok=True)
 
-        # Cria a subpasta
-        metadata = {
-            'name': subfolder_name,
-            'mimeType': 'application/vnd.google-apps.folder',
-            'parents': [parent_folder_id]
-        }
-        folder = service.files().create(body=metadata, fields='id').execute()
-        logger.info(f"📁 Subpasta '{subfolder_name}' criada.")
-        return folder['id']
+    def find_subfolder_id(self, parent_folder_id: str, subfolder_name: str) -> Optional[str]:
+        service = self._get_service()
+        query = (
+            f"'{_query_literal(parent_folder_id)}' in parents "
+            f"and name = '{_query_literal(subfolder_name)}' "
+            "and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+        )
+        result = self._execute(service.files().list(q=query, fields="files(id)"))
+        return next((item["id"] for item in result.get("files", [])), None)
+
+    def get_or_create_subfolder(self, parent_folder_id: str, subfolder_name: str) -> str:
+        existing = self.find_subfolder_id(parent_folder_id, subfolder_name)
+        if existing:
+            return existing
+        service = self._get_service()
+        created = self._execute(
+            service.files().create(
+                body={
+                    "name": subfolder_name,
+                    "mimeType": "application/vnd.google-apps.folder",
+                    "parents": [parent_folder_id],
+                },
+                fields="id",
+            )
+        )
+        return created["id"]
 
     def move_to_folder(self, file_id: str, destination_folder_id: str, file_name: str = "") -> bool:
-        """Move um arquivo para outra pasta no Google Drive.
-
-        Args:
-            file_id: ID do arquivo a mover.
-            destination_folder_id: ID da pasta de destino.
-            file_name: Nome do arquivo (para logging).
-
-        Returns:
-            True se moveu com sucesso, False se falhou.
-        """
+        """Idempotently move *file_id* into *destination_folder_id*."""
         service = self._get_service()
-        try:
-            # Busca os pais atuais do arquivo
-            file_info = service.files().get(fileId=file_id, fields='parents').execute()
-            previous_parents = ','.join(file_info.get('parents', []))
-
-            # Move: adiciona novo pai e remove o anterior
-            service.files().update(
-                fileId=file_id,
-                addParents=destination_folder_id,
-                removeParents=previous_parents,
-                fields='id, parents'
-            ).execute()
-
-            logger.info(f"📂 Arquivo movido para processados: {file_name}")
+        parents = self._execute(service.files().get(fileId=file_id, fields="parents")).get("parents", [])
+        if parents == [destination_folder_id]:
             return True
-        except Exception as e:
-            logger.error(f"⚠️ Erro ao mover {file_name}: {e}")
-            return False
+        arguments: dict[str, Any] = {"fileId": file_id, "fields": "id,parents"}
+        if destination_folder_id not in parents:
+            arguments["addParents"] = destination_folder_id
+        previous = [parent for parent in parents if parent != destination_folder_id]
+        if previous:
+            arguments["removeParents"] = ",".join(previous)
+        result = self._execute(service.files().update(**arguments))
+        moved = result.get("parents") == [destination_folder_id]
+        if moved:
+            logger.info("Arquivo movido no Drive: %s -> %s", file_name or file_id, destination_folder_id)
+        return moved
 
-    def _run(self, folder_id: str) -> List[Dict[str, str]]:
-        """Método de compatibilidade para o CrewAI. Agora retorna metadados."""
+    def _run(self, folder_id: str) -> list[dict]:
         return self.list_files(folder_id)
