@@ -1,0 +1,145 @@
+{
+  "version": "1.0.0",
+  "description": "Registry de templates de Cadeias de Custódia. Cada template define âncoras de detecção, mapa de campos e regras especiais.",
+  "templates": [
+    {
+      "name": "LAB_ALPHA",
+      "priority": 1,
+      "status": "validated",
+      "anchors": [
+        {
+          "text": "CADEIA DE CUSTODIA - LAB ALPHA",
+          "location": "cabeçalho",
+          "weight": 1.0
+        },
+        {
+          "text": "LAB ALPHA ANALISES",
+          "location": "cabeçalho/logotipo",
+          "weight": 0.9
+        }
+      ],
+      "field_map": {
+        "codigo": {
+          "location": "primeira coluna da tabela de amostras ou anotação manuscrita de 7 dígitos associada à linha da amostra",
+          "anchor": "Código da Amostra",
+          "type": "handwritten",
+          "format": "7 dígitos",
+          "notes": "Número manuscrito de 7 dígitos associado à mesma linha da identificação. Ignorar números de ordem de item."
+        },
+        "identificacao": {
+          "location": "coluna/campo 'Identificação da Amostra'",
+          "anchor": "Identificação da Amostra",
+          "type": "printed_or_handwritten",
+          "format": "texto livre (código de ponto, sigla ou descrição)",
+          "notes": "Usar exatamente como escrito, preservando prefixos e pontuação."
+        },
+        "data": {
+          "location": "campo/coluna 'Data da Coleta' na tabela principal",
+          "type": "printed_or_handwritten",
+          "format": "DD/MM/AAAA",
+          "anchor_aliases": [
+            "Data da Coleta",
+            "Dados de Coleta",
+            "Data"
+          ]
+        },
+        "hora": {
+          "location": "campo/coluna 'Hora da Coleta' na tabela principal",
+          "type": "printed_or_handwritten",
+          "format": "HH:MM",
+          "anchor_aliases": [
+            "Hora da Coleta",
+            "Hora"
+          ]
+        }
+      },
+      "special_rules": [
+        "Se houver mais de um código de 7 dígitos na página, escolher o que está na mesma linha/registro da identificação.",
+        "Se o formulário listar várias amostras, retornar uma entrada JSON por linha."
+      ]
+    },
+    {
+      "name": "LAB_BETA",
+      "priority": 2,
+      "status": "validated",
+      "anchors": [
+        {
+          "text": "FORMULARIO DE CUSTODIA - LAB BETA",
+          "location": "cabeçalho",
+          "weight": 1.0
+        },
+        {
+          "text": "LAB BETA AMBIENTAL",
+          "location": "rodapé/cabeçalho",
+          "weight": 0.9
+        }
+      ],
+      "field_map": {
+        "codigo": {
+          "location": "número manuscrito de 7 dígitos escrito no campo de rastreio interno da amostra",
+          "type": "handwritten",
+          "format": "7 dígitos",
+          "notes": "Se não houver número manuscrito de 7 dígitos, retornar vazio."
+        },
+        "identificacao": {
+          "location": "composição: '{protocolo} - {ponto_coleta}'",
+          "type": "computed",
+          "format": "{protocolo} - {ponto_coleta}",
+          "sources": {
+            "protocolo": {
+              "anchor": "PROTOCOLO:",
+              "format": "NNNN/AAAA"
+            },
+            "ponto_coleta": {
+              "anchor": "PONTO DE COLETA:",
+              "format": "texto completo do campo"
+            }
+          },
+          "notes": "Monte a identificação EXATAMENTE como: '{protocolo} - {ponto_coleta}'. Não usar 'TIPO DE AMOSTRA' como identificação."
+        },
+        "data": {
+          "location": "campo 'DATA/HORA COLETA' ou equivalente",
+          "type": "printed_or_handwritten",
+          "format": "DD/MM/AAAA",
+          "anchor_aliases": [
+            "DATA/HORA COLETA",
+            "Coletado em"
+          ]
+        },
+        "hora": {
+          "location": "campo 'DATA/HORA COLETA' ou equivalente (separar da data)",
+          "type": "printed_or_handwritten",
+          "format": "HH:MM",
+          "anchor_aliases": [
+            "DATA/HORA COLETA",
+            "Hora Coleta"
+          ]
+        }
+      },
+      "special_rules": [
+        "Aceitar formatos 'DD/MM/AAAA HH:MM' na mesma célula ou data e hora em campos separados.",
+        "Se não encontrar 'PROTOCOLO', não inventar: retornar 'identificacao' como string vazia."
+      ]
+    }
+  ],
+  "generic_fallback": {
+    "description": "Usado quando nenhum template bate com confiança. Extração genérica sem regras especiais.",
+    "template_name": "GENERICO",
+    "rules": [
+      "Retornar apenas os melhores candidatos para 'codigo' (7 dígitos), 'data' e 'hora' se houver.",
+      "Para 'identificacao', usar o campo mais claramente rotulado como identificação.",
+      "Não inventar valores. Se não encontrar com segurança, retornar string vazia."
+    ]
+  },
+  "global_rules": [
+    "Cada PDF pertence a UMA única empresa/template. Não misture regras de templates diferentes.",
+    "Ignore linhas de checklists, instruções e a grande tabela de parâmetros.",
+    "Ignore campos de assinatura, carimbo de recebimento e campos administrativos.",
+    "NUNCA misture regras de templates diferentes em um mesmo documento.",
+    "Se um campo não for encontrado com segurança, retorne string vazia — NUNCA invente valores.",
+    "Sempre extraia a data exatamente como está no papel. Se o ano não for especificado no formulário (ex: 15/05), deve-se inferir do contexto externo. NUNCA invente anos passados sem evidência clara no documento.",
+    "O horário deve ser SEMPRE no formato HH:MM (com dois pontos), nunca use 'h' ou outros separadores como '10h30' ou '10.30'. Use sempre ':'.",
+    "Ao ler números manuscritos em tabelas, ignore as linhas verticais (bordas) das células. Elas podem ser confundidas com o dígito '1' ou '7'.",
+    "O 'codigo' de amostra deve ter exatamente 7 dígitos numéricos."
+  ]
+}

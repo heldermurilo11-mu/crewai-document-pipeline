@@ -1,0 +1,28 @@
+download_files:
+  description: >
+    Utilize a ferramenta Google Drive Tool para baixar todos os arquivos PDF 
+    que estão na pasta de ID '{folder_id}'. 
+    Retorne uma lista exata de caminhos locais onde os arquivos foram salvos.
+  expected_output: >
+    Uma lista de metadados dos arquivos baixados, contendo no mínimo: file_path (caminho local) e file_id (ID do Drive, para uso futuro).
+  agent: drive_manager
+
+extract_data:
+  description: >
+    A partir da lista de arquivos baixados na tarefa anterior, itere sobre eles e
+    utilize a ferramenta de OCR para extrair os dados lógicos (código da amostra, 
+    identificação, data, hora). Retorne um array de JSON consolidando TUDO.
+  expected_output: >
+    Um array JSON onde cada elemento representa um arquivo e contém as amostras lidas ('samples'), 
+    bem como o seu 'file_path' e 'file_id' para rastro.
+  agent: ocr_specialist
+
+validate_and_export:
+  description: >
+    Pegue o resultado de OCR da tarefa anterior. Para cada item, use a ferramenta de 
+    Validação/Exportação. Ela deverá checar as amostras, criar/adicionar no CSV 
+    'output/resultado_crew.csv', limpar o arquivo local e mover o original 
+    no Drive para processados ou rejeitados.
+  expected_output: >
+    Um relatório final (string) sumarizando quantos itens foram processados com sucesso e quantos falharam.
+  agent: data_analyst
